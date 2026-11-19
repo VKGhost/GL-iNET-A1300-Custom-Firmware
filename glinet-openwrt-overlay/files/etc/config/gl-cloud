@@ -1,0 +1,8 @@
+config cloud 'cloud'
+	option enable '0'
+	option server 'gslb-eu.goodcloud.xyz'
+	option rtty_enable '0'
+	option rtty_host ''
+	option rtty_port '5912'
+	option rtty_token ''
+	option rtty_id ''

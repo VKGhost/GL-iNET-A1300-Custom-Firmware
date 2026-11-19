@@ -1,0 +1,5 @@
+config adguardhome 'config'
+	option enabled '0'
+	option port '3000'
+	option dns_port '3053'
+	option handle_client_requests '0'

@@ -1,0 +1,96 @@
+#!/bin/sh /etc/rc.common
+START=96
+STOP=15
+
+apply_addons() {
+	nft delete table inet gl_addons 2>/dev/null || true
+	nft add table inet gl_addons 2>/dev/null || return 0
+	nft add chain inet gl_addons input '{ type filter hook input priority filter - 10; policy accept; }'
+	nft add chain inet gl_addons forward '{ type filter hook forward priority filter - 10; policy accept; }'
+	nft add chain inet gl_addons dstnat '{ type nat hook prerouting priority dstnat - 5; policy accept; }'
+
+	# 1. MAC Blacklist / Whitelist (gl-black_white_list)
+	local bw_en=$(uci -q get gl-black_white_list.global.enable)
+	local bw_mode=$(uci -q get gl-black_white_list.global.mode)
+	if [ "$bw_en" = "1" ]; then
+		if [ "$bw_mode" = "black" ]; then
+			for mac in $(uci -q get gl-black_white_list.black.mac); do
+				nft add rule inet gl_addons forward ether saddr "$mac" counter drop 2>/dev/null
+				nft add rule inet gl_addons input ether saddr "$mac" udp dport != { 67, 68 } counter drop 2>/dev/null
+			done
+		elif [ "$bw_mode" = "white" ]; then
+			local wmacs=$(uci -q get gl-black_white_list.white.mac)
+			if [ -n "$wmacs" ]; then
+				for mac in $wmacs; do
+					nft add rule inet gl_addons forward iifname '{"br-lan", "br-guest"}' ether saddr "$mac" counter accept 2>/dev/null
+				done
+				nft add rule inet gl_addons forward iifname '{"br-lan", "br-guest"}' counter drop 2>/dev/null
+			fi
+		fi
+	fi
+
+	# 2. Guest -> LAN Isolation (gl-black_white_list.guest.transfer_enable)
+	local guest_lan=$(uci -q get gl-black_white_list.guest.transfer_enable)
+	if [ "$guest_lan" != "1" ]; then
+		nft add rule inet gl_addons forward iifname "br-guest" oifname "br-lan" counter drop 2>/dev/null
+	fi
+
+	# 3. Force Client DNS Redirect (gl-dns.dns.force_dns or adguardhome.config.handle_client_requests)
+	local force_dns=$(uci -q get gl-dns.dns.force_dns)
+	local agh_en=$(uci -q get adguardhome.config.enabled)
+	local agh_port=$(uci -q get adguardhome.config.dns_port)
+	[ -z "$agh_port" ] && agh_port="3053"
+
+	if [ "$agh_en" = "1" ]; then
+		nft add rule inet gl_addons dstnat iifname '{"br-lan", "br-guest"}' udp dport 53 counter redirect to :$agh_port 2>/dev/null
+		nft add rule inet gl_addons dstnat iifname '{"br-lan", "br-guest"}' tcp dport 53 counter redirect to :$agh_port 2>/dev/null
+	elif [ "$force_dns" = "1" ]; then
+		nft add rule inet gl_addons dstnat iifname '{"br-lan", "br-guest"}' udp dport 53 counter redirect to :53 2>/dev/null
+		nft add rule inet gl_addons dstnat iifname '{"br-lan", "br-guest"}' tcp dport 53 counter redirect to :53 2>/dev/null
+	fi
+
+	# 4. Parental Control MAC & Domain Blocking
+	mkdir -p /tmp/dnsmasq.d
+	rm -f /tmp/dnsmasq.d/gl-parental.conf
+	local pc_en=$(uci -q get parental_control.global.enable)
+	if [ "$pc_en" = "1" ]; then
+		for mac in $(uci -q get parental_control.global.blocked_macs); do
+			nft add rule inet gl_addons forward ether saddr "$mac" counter drop 2>/dev/null
+		done
+		for dom in $(uci -q get parental_control.global.blocked_domains); do
+			echo "address=/${dom}/0.0.0.0" >> /tmp/dnsmasq.d/gl-parental.conf
+			echo "address=/${dom}/::" >> /tmp/dnsmasq.d/gl-parental.conf
+		done
+		/etc/init.d/dnsmasq reload 2>/dev/null || true
+	fi
+
+	# 5. Drop-in Gateway (edgerouter) DNS intercept
+	local er_en=$(uci -q get edgerouter.global.enabled)
+	if [ "$er_en" = "1" ] && [ "$(uci -q get edgerouter.global.force_dns)" = "1" ]; then
+		nft add rule inet gl_addons dstnat iifname "br-lan" udp dport 53 counter redirect to :53 2>/dev/null
+		nft add rule inet gl_addons dstnat iifname "br-lan" tcp dport 53 counter redirect to :53 2>/dev/null
+	fi
+
+	# 6. Bandwidth QoS (tc qdisc on wan)
+	local qos_en=$(uci -q get qos.general.enable)
+	local up_mbps=$(uci -q get qos.general.upload)
+	local down_mbps=$(uci -q get qos.general.download)
+	tc qdisc del dev wan root 2>/dev/null || true
+	if [ "$qos_en" = "1" ] && [ -n "$up_mbps" ] && command -v tc >/dev/null 2>&1; then
+		tc qdisc add dev wan root cake bandwidth "${up_mbps}Mbit" 2>/dev/null || \
+			tc qdisc add dev wan root tbf rate "${up_mbps}mbit" burst 32kbit latency 400ms 2>/dev/null || true
+	fi
+}
+
+start() {
+	apply_addons
+}
+
+reload() {
+	apply_addons
+}
+
+stop() {
+	nft delete table inet gl_addons 2>/dev/null || true
+	tc qdisc del dev wan root 2>/dev/null || true
+}

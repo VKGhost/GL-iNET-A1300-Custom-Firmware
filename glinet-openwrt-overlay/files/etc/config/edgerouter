@@ -1,0 +1,4 @@
+config global 'global'
+	option enabled '0'
+	option force_dns '1'
+	option main_router_ip ''

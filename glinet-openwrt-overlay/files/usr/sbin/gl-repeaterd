@@ -1,0 +1,44 @@
+#!/bin/sh
+# GL.iNet Repeater (WISP/STA) Auto-Connect & Fail-safe Daemon for OpenWrt 25.12
+
+. /lib/functions.sh
+. /usr/share/libubox/jshn.sh
+
+check_wwan_connected() {
+	local status=$(ubus -S call network.interface.wwan status 2>/dev/null)
+	[ -z "$status" ] && return 1
+	json_init
+	json_load "$status"
+	local up=0
+	json_get_var up up
+	[ "$up" = "1" ] && return 0
+	return 1
+}
+
+while true; do
+	enable=$(uci -q get repeater.main.enable)
+	auto=$(uci -q get repeater.main.auto)
+	interval=$(uci -q get repeater.main.scan_interval)
+	[ -z "$interval" ] || [ "$interval" -lt 15 ] 2>/dev/null && interval=60
+
+	if [ "$enable" = "1" ] && [ "$auto" = "1" ]; then
+		if ! check_wwan_connected; then
+			# If STA is enabled but failing to associate for a long time, it can block AP on single-channel PHY.
+			# Check if saved network is in range via iwinfo scan.
+			target_ssid=$(uci -q get wireless.sta.ssid)
+			target_dev=$(uci -q get wireless.sta.device)
+			if [ -n "$target_ssid" ] && [ -n "$target_dev" ]; then
+				scan_out=$(ubus -S call iwinfo scan "{\"device\":\"$target_dev\"}" 2>/dev/null)
+				if echo "$scan_out" | grep -q "\"ssid\":\"$target_ssid\""; then
+					if [ "$(uci -q get wireless.sta.disabled)" = "1" ]; then
+						logger -t "gl-repeaterd" "Target SSID '$target_ssid' found in scan; enabling STA"
+						uci set wireless.sta.disabled='0'
+						uci commit wireless
+						wifi reload
+					fi
+				fi
+			fi
+		fi
+	fi
+	sleep "$interval"
+done

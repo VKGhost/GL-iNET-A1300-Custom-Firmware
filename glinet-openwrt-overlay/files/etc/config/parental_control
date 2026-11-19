@@ -1,0 +1,3 @@
+config global 'global'
+	option enable '0'
+	option drop_anonymous '0'

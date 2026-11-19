@@ -1,0 +1,6 @@
+config ddns 'glddns'
+	option enabled '0'
+	option domain ''
+	option provider 'glddns'
+	option username ''
+	option password ''

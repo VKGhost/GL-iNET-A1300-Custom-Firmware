@@ -1,0 +1,6 @@
+config led 'global'
+	option led_enable '1'
+	option led_mode 'white'
+	option schedule_enable '0'
+	option schedule_start '22:00'
+	option schedule_end '07:00'

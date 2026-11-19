@@ -1,0 +1,22 @@
+#!/bin/sh
+logger -t "gl-switch" "Button=${BUTTON} Action=${ACTION} Type=${TYPE}"
+
+action="off"
+[ "$ACTION" = "pressed" ] && action="on"
+
+# Save physical switch state for UI
+mkdir -p /var/run
+echo "$action" > /var/run/gl_switch_state
+
+func=$(uci -q get switch-button.@main[0].func)
+[ -z "$func" ] && func="wifi"
+
+if [ "$func" = "none" ]; then
+	logger -t "gl-switch" "Switch button disabled (func=none)"
+	exit 0
+fi
+
+if [ -x "/etc/gl-switch.d/${func}.sh" ]; then
+	flock -n /var/lock/gl-switch.lock "/etc/gl-switch.d/${func}.sh" "$action" &
+fi
+exit 0

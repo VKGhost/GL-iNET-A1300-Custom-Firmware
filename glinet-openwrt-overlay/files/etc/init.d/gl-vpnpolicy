@@ -1,0 +1,60 @@
+#!/bin/sh /etc/rc.common
+START=94
+STOP=15
+
+apply_vpnpolicy() {
+	# Remove existing gl_vpnpolicy nft table if present
+	nft delete table inet gl_vpnpolicy 2>/dev/null || true
+
+	local kill_switch=$(uci -q get vpnpolicy.global.kill_switch)
+	local wan_access=$(uci -q get vpnpolicy.global.wan_access)
+	local proxy_mode=$(uci -q get vpnpolicy.route_policy.proxy_mode)
+	local mode=$(uci -q get vpnpolicy.route_policy.mode)
+	local rule_type=$(uci -q get vpnpolicy.route_policy.rule_type)
+	local wg_en=$(uci -q get wireguard.global.enabled)
+	local ovpn_en=$(uci -q get ovpnclient.global.enable)
+
+	# Build nftables table for Kill Switch, Policy Marking, and Automatic VPN NAT/Forwarding
+	nft add table inet gl_vpnpolicy 2>/dev/null || return 0
+	nft add chain inet gl_vpnpolicy forward '{ type filter hook forward priority filter - 5; policy accept; }'
+	nft add chain inet gl_vpnpolicy prerouting '{ type filter hook prerouting priority mangle; policy accept; }'
+	nft add chain inet gl_vpnpolicy postrouting '{ type nat hook postrouting priority srcnat; policy accept; }'
+
+	# Ensure ALL VPN outbound traffic is masqueraded (NAT) so remote VPN servers accept LAN packets
+	nft add rule inet gl_vpnpolicy postrouting oifname '{"wg*", "tun*", "tailscale*", "zt*"}' counter masquerade 2>/dev/null
+
+	# Ensure forwarding from LAN & Guest to any active VPN interface is allowed
+	nft add rule inet gl_vpnpolicy forward iifname '{"br-lan", "br-guest"}' oifname '{"wg*", "tun*", "tailscale*", "zt*"}' counter accept 2>/dev/null
+
+	# If Kill Switch is enabled (1), drop forwarding from br-lan / br-guest to non-VPN WAN interfaces
+	if [ "$kill_switch" = "1" ]; then
+		if [ "$wan_access" = "1" ]; then
+			# Allow RFC1918 local WAN subnet access before dropping internet traffic
+			nft add rule inet gl_vpnpolicy forward iifname '{"br-lan", "br-guest"}' ip daddr '{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }' counter accept 2>/dev/null
+		fi
+		# Allow traffic egressing via any VPN tunnel
+		nft add rule inet gl_vpnpolicy forward iifname '{"br-lan", "br-guest"}' oifname '{"wg*", "tun*", "tailscale*", "zt*"}' counter accept 2>/dev/null
+		# Block direct leak out wan / wwan / usb0 / wwan0 when Kill Switch is active
+		nft add rule inet gl_vpnpolicy forward iifname '{"br-lan", "br-guest"}' oifname '{"wan", "eth1", "phy0-sta0", "phy1-sta0", "wlan0-1", "wlan1-1", "usb0", "wwan0"}' counter reject 2>/dev/null
+	fi
+
+	# Client MAC / IP policy routing marks (0x8000 = bypass VPN / direct WAN when rule_type=bypass)
+	if [ "$proxy_mode" = "1" ] && [ "$mode" = "mac" ]; then
+		local macs=$(uci -q get vpnpolicy.route_policy.mac_list)
+		for mac in $macs; do
+			nft add rule inet gl_vpnpolicy prerouting ether saddr "$mac" meta mark set 0x8000 counter 2>/dev/null
+		done
+	fi
+}
+
+start() {
+	apply_vpnpolicy
+}
+
+reload() {
+	apply_vpnpolicy
+}
+
+stop() {
+	nft delete table inet gl_vpnpolicy 2>/dev/null || true
+}

@@ -1,0 +1,44 @@
+#!/bin/sh
+# Controls GL-A1300 LEDs on both OpenWrt 25.12 DTB (blue:status / white:status) and legacy/I2C
+
+BLUE_LED=""
+WHITE_LED=""
+for d in /sys/class/leds/blue:status /sys/class/leds/gl-a1300:blue; do
+	[ -d "$d" ] && { BLUE_LED="$d"; break; }
+done
+for d in /sys/class/leds/white:status /sys/class/leds/gl-a1300:white; do
+	[ -d "$d" ] && { WHITE_LED="$d"; break; }
+done
+
+enable=$(uci -q get gl_led.global.led_enable)
+mode=$(uci -q get gl_led.global.led_mode)
+[ -z "$enable" ] && enable="1"
+[ -z "$mode" ] && mode="white"
+[ -n "$1" ] && mode="$1"
+
+if [ "$enable" = "0" ] || [ "$mode" = "off" ]; then
+	[ -n "$BLUE_LED" ] && { echo none > "$BLUE_LED/trigger" 2>/dev/null; echo 0 > "$BLUE_LED/brightness" 2>/dev/null; }
+	[ -n "$WHITE_LED" ] && { echo none > "$WHITE_LED/trigger" 2>/dev/null; echo 0 > "$WHITE_LED/brightness" 2>/dev/null; }
+	command -v gl_i2c_led >/dev/null 2>&1 && gl_i2c_led off 2>/dev/null
+	exit 0
+fi
+
+case "$mode" in
+	white)
+		[ -n "$BLUE_LED" ] && { echo none > "$BLUE_LED/trigger" 2>/dev/null; echo 0 > "$BLUE_LED/brightness" 2>/dev/null; }
+		[ -n "$WHITE_LED" ] && { echo default-on > "$WHITE_LED/trigger" 2>/dev/null; echo 1 > "$WHITE_LED/brightness" 2>/dev/null; }
+		;;
+	blue)
+		[ -n "$WHITE_LED" ] && { echo none > "$WHITE_LED/trigger" 2>/dev/null; echo 0 > "$WHITE_LED/brightness" 2>/dev/null; }
+		[ -n "$BLUE_LED" ] && { echo default-on > "$BLUE_LED/trigger" 2>/dev/null; echo 1 > "$BLUE_LED/brightness" 2>/dev/null; }
+		;;
+	breathe|blink)
+		[ -n "$WHITE_LED" ] && { echo none > "$WHITE_LED/trigger" 2>/dev/null; echo 0 > "$WHITE_LED/brightness" 2>/dev/null; }
+		[ -n "$BLUE_LED" ] && {
+			echo timer > "$BLUE_LED/trigger" 2>/dev/null
+			echo 500 > "$BLUE_LED/delay_on" 2>/dev/null
+			echo 500 > "$BLUE_LED/delay_off" 2>/dev/null
+		}
+		;;
+esac
+exit 0

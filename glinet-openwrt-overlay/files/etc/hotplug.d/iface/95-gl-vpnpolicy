@@ -1,0 +1,41 @@
+#!/bin/sh
+[ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifdown" ] || exit 0
+
+is_vpn=0
+proto=$(uci -q get network.${INTERFACE}.proto)
+
+case "$INTERFACE" in
+	wg*|*vpn*|tailscale*|zt*) is_vpn=1 ;;
+esac
+case "$DEVICE" in
+	wg*|tun*|tailscale*|zt*) is_vpn=1 ;;
+esac
+[ "$proto" = "wireguard" ] && is_vpn=1
+
+[ "$is_vpn" = "1" ] || exit 0
+
+if [ "$ACTION" = "ifup" ]; then
+	# Ensure interface is in firewall vpn zone with NAT masquerade
+	cur_nets=$(uci -q get firewall.vpn_zone.network)
+	case " $cur_nets " in
+		*" ${INTERFACE} "*) ;;
+		*)
+			uci -q add_list firewall.vpn_zone.network="${INTERFACE}"
+			uci -q set firewall.vpn_zone.masq='1'
+			uci -q set firewall.vpn_zone.mtu_fix='1'
+			uci -q commit firewall
+			/etc/init.d/firewall reload 2>/dev/null || true
+			;;
+	esac
+
+	# If this is a WireGuard or OpenVPN interface with 0.0.0.0/0 peer, ensure default route metric is prioritized
+	dev_name="${DEVICE:-$INTERFACE}"
+	if [ -n "$dev_name" ] && ip link show "$dev_name" >/dev/null 2>&1; then
+		# Add default route with metric 5 so it takes precedence over WAN (metric 10)
+		if ! ip route show | grep -q "default.*dev $dev_name"; then
+			ip route add default dev "$dev_name" metric 5 2>/dev/null || true
+		fi
+	fi
+fi
+
+/etc/init.d/gl-vpnpolicy reload 2>/dev/null || true

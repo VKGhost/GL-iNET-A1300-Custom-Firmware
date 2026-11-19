@@ -1,0 +1,80 @@
+#!/bin/sh
+# GL.iNet Multi-WAN (kmwan equivalent) Health Monitor & Route Priority Daemon
+
+. /lib/functions.sh
+. /usr/share/libubox/jshn.sh
+
+STATE_FILE="/var/run/gl-mwan.json"
+
+get_if_l3dev() {
+	local iface="$1"
+	local st=$(ubus -S call "network.interface.${iface}" status 2>/dev/null)
+	[ -z "$st" ] && return 1
+	json_init
+	json_load "$st"
+	local up l3_device
+	json_get_var up up
+	json_get_var l3_device l3_device
+	[ "$up" = "1" ] && [ -n "$l3_device" ] && {
+		echo "$l3_device"
+		return 0
+	}
+	return 1
+}
+
+check_if_health() {
+	local dev="$1"
+	local tracks="$2"
+	[ -z "$tracks" ] && tracks="1.1.1.1 8.8.8.8"
+	for ip in $tracks; do
+		if ping -c 1 -W 2 -I "$dev" "$ip" >/dev/null 2>&1; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+while true; do
+	enable=$(uci -q get kmwan.global.enable)
+	mode=$(uci -q get kmwan.global.mode)
+	interval=$(uci -q get kmwan.global.interval)
+	[ -z "$interval" ] || [ "$interval" -lt 3 ] 2>/dev/null && interval=10
+	[ -z "$mode" ] && mode="failover"
+
+	json_init
+	json_add_boolean "enabled" "${enable:-1}"
+	json_add_string "mode" "$mode"
+	json_add_object "interfaces"
+
+	for m in wan wwan tethering modem; do
+		disabled=$(uci -q get "kmwan.${m}.disabled")
+		metric=$(uci -q get "kmwan.${m}.metric")
+		weight=$(uci -q get "kmwan.${m}.weight")
+		tracks=$(uci -q get "kmwan.${m}.tracks")
+		[ -z "$metric" ] && metric=10
+
+		dev=$(get_if_l3dev "$m")
+		state="offline"
+		if [ -n "$dev" ] && [ "$disabled" != "1" ]; then
+			if check_if_health "$dev" "$tracks"; then
+				state="online"
+			else
+				state="degraded"
+			fi
+		fi
+
+		json_add_object "$m"
+		json_add_string "state" "$state"
+		json_add_string "device" "${dev:-}"
+		json_add_int "metric" "${metric:-10}"
+		json_add_int "weight" "${weight:-1}"
+		json_add_boolean "disabled" "${disabled:-0}"
+		json_close_object
+	done
+
+	json_close_object
+	json_dump > "${STATE_FILE}.tmp"
+	mv -f "${STATE_FILE}.tmp" "$STATE_FILE"
+
+	sleep "$interval"
+done

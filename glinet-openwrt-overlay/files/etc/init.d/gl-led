@@ -1,0 +1,11 @@
+#!/bin/sh /etc/rc.common
+START=95
+USE_PROCD=1
+
+start_service() {
+	/usr/sbin/gl-led-ctl
+}
+
+reload_service() {
+	/usr/sbin/gl-led-ctl
+}

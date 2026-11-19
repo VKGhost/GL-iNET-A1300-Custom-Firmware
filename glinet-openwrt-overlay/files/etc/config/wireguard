@@ -1,0 +1,4 @@
+config proxy 'global'
+	option enabled '0'
+	option active_profile ''
+	option global_proxy '1'

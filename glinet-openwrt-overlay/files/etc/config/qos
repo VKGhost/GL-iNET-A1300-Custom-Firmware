@@ -1,0 +1,5 @@
+config qos 'general'
+	option enable '0'
+	option model 'cake'
+	option upload '100'
+	option download '100'

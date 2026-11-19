@@ -1,0 +1,9 @@
+config timer 'reboot'
+	option enable '0'
+	option time '04:00'
+	option weekdays '1 2 3 4 5 6 0'
+
+config timer 'wifi'
+	option enable '0'
+	option off_time '23:30'
+	option on_time '06:30'

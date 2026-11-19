@@ -1,0 +1,4 @@
+config service 'general'
+	option mode 'router'
+	option usb_power '1'
+	option lan2wan '0'

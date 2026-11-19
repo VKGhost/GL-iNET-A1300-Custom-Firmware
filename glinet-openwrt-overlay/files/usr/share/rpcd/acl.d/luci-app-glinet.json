@@ -1,0 +1,39 @@
+{
+	"luci-app-glinet": {
+		"description": "Grant access to GL.iNet Center backend and configurations",
+		"read": {
+			"ubus": {
+				"glinet": [ "*" ],
+				"iwinfo": [ "*" ],
+				"network": [ "*" ],
+				"network.device": [ "*" ],
+				"network.interface": [ "*" ],
+				"network.interface.*": [ "*" ],
+				"system": [ "*" ],
+				"session": [ "*" ]
+			},
+			"uci": [ "*" ],
+			"file": {
+				"/var/run/*": [ "read" ],
+				"/tmp/*": [ "read" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"glinet": [ "*" ],
+				"iwinfo": [ "*" ],
+				"network": [ "*" ],
+				"network.device": [ "*" ],
+				"network.interface": [ "*" ],
+				"network.interface.*": [ "*" ],
+				"system": [ "*" ],
+				"session": [ "*" ]
+			},
+			"uci": [ "*" ],
+			"file": {
+				"/var/run/*": [ "write" ],
+				"/tmp/*": [ "write" ]
+			}
+		}
+	}
+}

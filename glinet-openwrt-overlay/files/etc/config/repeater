@@ -1,0 +1,8 @@
+config main 'main'
+	option enable '0'
+	option auto '1'
+	option band 'auto'
+	option scan_interval '60'
+	option switch_interval '30'
+	option lock_bssid '0'
+	option active_ssid ''

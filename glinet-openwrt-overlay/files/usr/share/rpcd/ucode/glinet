@@ -1,0 +1,1511 @@
+// GL.iNet Feature Suite Backend for OpenWrt 25.12 (rpcd ucode plugin)
+// Replicates GL.iNet 4.x backend capabilities natively on OpenWrt 25.12 UCI/ubus/fw4
+
+'use strict';
+
+import { access, open, popen, lsdir, readfile, writefile, mkdir } from 'fs';
+import { cursor } from 'uci';
+import { connect } from 'ubus';
+
+function String(v) {
+	return (v == null) ? '' : sprintf('%s', v);
+}
+
+function shellquote(s) {
+	return `'${replace(String(s ?? ''), "'", "'\\''")}'`;
+}
+
+function run_cmd(cmd) {
+	let fd = popen(cmd + ' 2>/dev/null', 'r');
+	if (!fd) return '';
+	let out = fd.read('all') || '';
+	fd.close();
+	return trim(out);
+}
+
+function run_bg(cmd) {
+	system('(' + cmd + ') >/dev/null 2>&1 &');
+}
+
+function parse_json_safe(str, fallback) {
+	if (!str) return fallback;
+	try {
+		return json(str);
+	} catch (e) {
+		return fallback;
+	}
+}
+
+function get_factory_mac() {
+	let mac = trim(readfile('/sys/class/net/wan/address') || readfile('/sys/class/net/eth0/address') || readfile('/sys/class/net/br-lan/address') || '');
+	return mac || '94:83:C4:1A:13:00';
+}
+
+function get_if_status(ubus_conn, iface) {
+	let st = ubus_conn.call(`network.interface.${iface}`, 'status');
+	if (!st) return { up: false, proto: '', ipaddr: '', netmask: '', gateway: '', dns: [], device: '' };
+	let ipv4 = st['ipv4-address']?.[0] || {};
+	let gw = '';
+	for (let r in (st.route || [])) {
+		if (r.target == '0.0.0.0' && r.mask == 0) {
+			gw = r.nexthop;
+			break;
+		}
+	}
+	let dns_list = [];
+	for (let d in (st['dns-server'] || [])) {
+		push(dns_list, d);
+	}
+	return {
+		up: !!st.up,
+		proto: st.proto || '',
+		ipaddr: ipv4.address || '',
+		netmask: ipv4.mask ? `${ipv4.mask}` : '',
+		gateway: gw,
+		dns: dns_list,
+		device: st.l3_device || st.device || ''
+	};
+}
+
+function parse_wg_conf(conf_text) {
+	let ret = {
+		private_key: '',
+		address: '',
+		dns: '',
+		mtu: '1420',
+		public_key: '',
+		preshared_key: '',
+		endpoint_host: '',
+		endpoint_port: '51820',
+		allowed_ips: '0.0.0.0/0',
+		persistent_keepalive: '25'
+	};
+	let sec = '';
+	for (let line in split(conf_text, '\n')) {
+		line = trim(line);
+		if (!length(line) || match(line, /^#/)) continue;
+		let m_sec = match(line, /^\[([A-Za-z0-9_-]+)\]/);
+		if (m_sec) {
+			sec = lc(m_sec[1]);
+			continue;
+		}
+		let eq_idx = index(line, '=');
+		if (eq_idx < 1) continue;
+		let k = lc(trim(substr(line, 0, eq_idx)));
+		let v = trim(substr(line, eq_idx + 1));
+		if (sec == 'interface') {
+			if (k == 'privatekey') ret.private_key = v;
+			else if (k == 'address') ret.address = v;
+			else if (k == 'dns') ret.dns = v;
+			else if (k == 'mtu') ret.mtu = v;
+		} else if (sec == 'peer') {
+			if (k == 'publickey') ret.public_key = v;
+			else if (k == 'presharedkey') ret.preshared_key = v;
+			else if (k == 'endpoint') {
+				let ep = split(v, /:/);
+				ret.endpoint_host = ep[0];
+				if (length(ep) > 1) ret.endpoint_port = ep[1];
+			} else if (k == 'allowedips') ret.allowed_ips = v;
+			else if (k == 'persistentkeepalive') ret.persistent_keepalive = v;
+		}
+	}
+	return ret;
+}
+
+function collect_clients(c, ubus_conn) {
+	let clients = [];
+	let seen = {};
+
+	let leases_txt = readfile('/tmp/dhcp.leases') || readfile('/var/dhcp.leases') || '';
+	for (let line in split(leases_txt, '\n')) {
+		line = trim(line);
+		if (!length(line)) continue;
+		let f = split(line, /\s+/);
+		if (length(f) >= 4) {
+			let mac = uc(f[1]);
+			seen[mac] = {
+				ip: f[2],
+				hostname: (f[3] != '*') ? f[3] : '',
+				mac: mac
+			};
+		}
+	}
+
+	let arp_txt = readfile('/proc/net/arp') || '';
+	for (let line in split(arp_txt, '\n')) {
+		let f = split(trim(line), /\s+/);
+		if (length(f) >= 6 && f[0] != 'IP') {
+			let mac = uc(f[3]);
+			if (mac != '00:00:00:00:00:00') {
+				if (!seen[mac]) {
+					seen[mac] = { ip: f[0], hostname: '', mac: mac, dev: f[5] };
+				} else {
+					seen[mac].dev = f[5];
+				}
+			}
+		}
+	}
+
+	let black_macs = c.get('gl-black_white_list', 'black', 'mac') || [];
+	if (type(black_macs) == 'string') black_macs = [ black_macs ];
+
+	let qos_rules = {};
+	c.foreach('qos', 'queue', function(s) {
+		if (s.mac) {
+			qos_rules[uc(s.mac)] = {
+				upload: int(s.upload || 0),
+				download: int(s.download || 0)
+			};
+		}
+	});
+
+	for (let mac in seen) {
+		let cl = seen[mac];
+		let is_blocked = (index(black_macs, mac) >= 0);
+		let q = qos_rules[mac] || { upload: 0, download: 0 };
+		push(clients, {
+			mac: mac,
+			ip: cl.ip || '',
+			hostname: cl.hostname || '',
+			interface: (cl.dev == 'br-guest') ? 'guest' : 'lan',
+			rx_bytes: 0,
+			tx_bytes: 0,
+			rx_rate: 0,
+			tx_rate: 0,
+			blocked: is_blocked,
+			upload_limit: q.upload,
+			download_limit: q.download
+		});
+	}
+
+	return clients;
+}
+
+function parse_iw_scan(txt, dev) {
+	let cells = [];
+	let current = null;
+	for (let line in split(txt, '\n')) {
+		let m_bss = match(line, /^BSS ([0-9a-fA-F:]{17})/);
+		if (m_bss) {
+			if (current && current.ssid) push(cells, current);
+			current = { bssid: m_bss[1], ssid: '', signal: -80, channel: 0, device: dev, encryption: { enabled: false } };
+			continue;
+		}
+		if (!current) continue;
+		let m_sig = match(line, /signal: (-?[0-9.]+) dBm/);
+		if (m_sig) current.signal = int(m_sig[1]);
+		let m_ssid = match(line, /SSID: (.*)$/);
+		if (m_ssid) current.ssid = trim(m_ssid[1]);
+		let m_ds = match(line, /DS Parameter set: channel ([0-9]+)/);
+		if (m_ds) current.channel = int(m_ds[1]);
+		let m_prim = match(line, /primary channel: ([0-9]+)/);
+		if (m_prim) current.channel = int(m_prim[1]);
+		if (match(line, /RSN:|WPA:/)) current.encryption.enabled = true;
+	}
+	if (current && current.ssid) push(cells, current);
+	return cells;
+}
+
+const methods = {
+	get_dashboard: {
+		call: function() {
+			let c = cursor();
+			let ubus_conn = connect();
+
+			let wan_st = get_if_status(ubus_conn, 'wan');
+			let wwan_st = get_if_status(ubus_conn, 'wwan');
+			let teth_st = get_if_status(ubus_conn, 'tethering');
+			let modem_st = get_if_status(ubus_conn, 'modem');
+
+			let sys_info = ubus_conn.call('system', 'info') || {};
+			let board_info = ubus_conn.call('system', 'board') || {};
+
+			let repeater_known = [];
+			c.foreach('repeater', 'sta', function(s) {
+				push(repeater_known, {
+					id: s['.name'],
+					ssid: s.ssid || '',
+					bssid: s.bssid || '',
+					encryption: s.encryption || 'none',
+					device: s.device || 'radio0',
+					channel: s.channel || ''
+				});
+			});
+
+			let conn_ssid = c.get('repeater', 'general', 'connected_ssid') || '';
+			if (!conn_ssid) {
+				c.foreach('wireless', 'wifi-iface', function(s) {
+					if (s.mode == 'sta' && s.disabled != '1' && s.ssid) conn_ssid = s.ssid;
+				});
+			}
+			let cur_mac = trim(readfile('/sys/class/net/wan/address') || readfile('/sys/class/net/br-lan/address') || '');
+			let f_mac = get_factory_mac();
+
+			let cur_temp = 42;
+			let t_raw = readfile('/sys/class/thermal/thermal_zone0/temp');
+			if (t_raw) cur_temp = int(int(trim(t_raw)) / 1000);
+
+			let clients_list = collect_clients(c, ubus_conn);
+			let lan_count = 0;
+			let guest_count = 0;
+			let blocked_count = 0;
+			for (let cl in clients_list) {
+				if (cl.blocked) blocked_count++;
+				if (cl.interface == 'guest') guest_count++;
+				else lan_count++;
+			}
+
+			let wg_client_up = (get_if_status(ubus_conn, 'wgclient').up == true);
+
+			return {
+				system: {
+					model: board_info.model || 'GL.iNet GL-A1300',
+					release: board_info.release?.description || 'OpenWrt 25.12',
+					uptime: sys_info.uptime || 0,
+					load: sys_info.load || [0, 0, 0],
+					mem_total: sys_info.memory?.total || 0,
+					mem_free: sys_info.memory?.free || 0,
+					mem_used_pct: sys_info.memory ? int(((sys_info.memory.total - sys_info.memory.free) * 100) / sys_info.memory.total) : 0,
+					temp_c: cur_temp,
+					switch_func: c.get('switch-button', 'main', 'func') || 'wifi',
+					switch_state: trim(readfile('/var/run/gl_switch_state') || 'on'),
+					netmode: c.get('glconfig', 'general', 'mode') || 'router'
+				},
+				internet: {
+					wan: {
+						up: wan_st.up,
+						ipaddr: wan_st.ipaddr,
+						mask: wan_st.netmask,
+						gateway: wan_st.gateway,
+						dns: wan_st.dns,
+						macaddr: cur_mac,
+						proto: wan_st.proto,
+						uci_proto: c.get('network', 'wan', 'proto') || 'dhcp'
+					},
+					repeater: {
+						enable: (c.get('repeater', 'general', 'enabled') == '1') || wwan_st.up,
+						up: wwan_st.up,
+						ssid: conn_ssid,
+						bssid: c.get('repeater', 'general', 'connected_bssid') || '',
+						encryption: c.get('repeater', 'general', 'connected_enc') || '',
+						ipaddr: wwan_st.ipaddr,
+						gateway: wwan_st.gateway,
+						auto: (c.get('repeater', 'general', 'auto') != '0'),
+						known_networks: repeater_known
+					},
+					tethering: {
+						enable: (c.get('network', 'tethering', 'disabled') != '1'),
+						up: teth_st.up,
+						ipaddr: teth_st.ipaddr,
+						device: 'usb0',
+						usb_power: (c.get('glconfig', 'general', 'usb_power') != '0')
+					},
+					modem: {
+						enable: (c.get('glmodem', 'general', 'enable') == '1'),
+						up: modem_st.up,
+						ipaddr: modem_st.ipaddr,
+						apn: c.get('glmodem', 'general', 'apn') || 'internet',
+						pincode: c.get('glmodem', 'general', 'pin') || ''
+					},
+					multiwan: {
+						enabled: (c.get('kmwan', 'general', 'enabled') == '1'),
+						mode: c.get('kmwan', 'general', 'mode') || 'failover',
+						default_wan: c.get('kmwan', 'general', 'default_wan') || 'wan'
+					},
+					macclone: {
+						factory_mac: f_mac,
+						mac: cur_mac,
+						mode: c.get('gl_macclone', 'mac', 'mode') || '0'
+					}
+				},
+				vpn: {
+					wg_client_enabled: (c.get('wireguard', 'global', 'enabled') == '1'),
+					wg_client_up: wg_client_up,
+					wg_ip: get_if_status(ubus_conn, 'wgclient').ipaddr,
+					wg_server_enabled: (c.get('wireguard_server', 'main_server', 'enable') == '1'),
+					ovpn_client_enabled: (c.get('ovpnclient', 'global', 'enable') == '1'),
+					kill_switch: (c.get('vpnpolicy', 'global', 'kill_switch') == '1'),
+					tailscale_enabled: (c.get('tailscale', 'settings', 'enabled') == '1'),
+					zerotier_enabled: (c.get('zerotier', 'gl', 'enabled') == '1')
+				},
+				clients_summary: {
+					total: length(clients_list),
+					lan_count: lan_count,
+					guest_count: guest_count,
+					blocked_count: blocked_count
+				}
+			};
+		}
+	},
+
+	set_wan: {
+		args: {
+			proto: "",
+			ipaddr: "",
+			netmask: "",
+			gateway: "",
+			dns: "",
+			username: "",
+			password: "",
+			mtu: "",
+			vlan: ""
+		},
+		call: function(req) {
+			let a = req.args || {};
+			let proto = a.proto || 'dhcp';
+			let c = cursor();
+
+			c.set('network', 'wan', 'proto', proto);
+			if (proto == 'static') {
+				if (a.ipaddr) c.set('network', 'wan', 'ipaddr', a.ipaddr);
+				if (a.netmask) c.set('network', 'wan', 'netmask', a.netmask);
+				if (a.gateway) c.set('network', 'wan', 'gateway', a.gateway);
+				if (a.dns) {
+					let d_list = split(trim(a.dns), /[\s,]+/);
+					c.set('network', 'wan', 'dns', filter(d_list, x => length(x) > 0));
+				}
+			} else if (proto == 'pppoe') {
+				if (a.username) c.set('network', 'wan', 'username', a.username);
+				if (a.password) c.set('network', 'wan', 'password', a.password);
+			}
+
+			if (a.mtu) {
+				c.set('network', 'wan', 'mtu', String(int(a.mtu)));
+			}
+
+			c.commit('network');
+			run_bg('/etc/init.d/network reload');
+			return { ok: true };
+		}
+	},
+
+	scan_wifi: {
+		args: { band: "" },
+		call: function(req) {
+			let c = cursor();
+			let ubus_conn = connect();
+			let results = [];
+			let seen = {};
+
+			let ifaces = [];
+			let ubus_devs = ubus_conn.call('iwinfo', 'devices');
+			for (let d in (ubus_devs?.devices || [])) {
+				if (index(ifaces, d) < 0) push(ifaces, d);
+			}
+
+			for (let dev in lsdir('/sys/class/net')) {
+				if (match(dev, /^(wlan|ath|ra)/) && access('/sys/class/net/' + dev + '/phy80211') && index(ifaces, dev) < 0) {
+					push(ifaces, dev);
+				}
+			}
+
+			if (!length(ifaces)) {
+				for (let phy in lsdir('/sys/class/ieee80211')) {
+					let tmp_if = 'glscan_' + phy;
+					run_cmd('iw phy ' + shellquote(phy) + ' interface add ' + shellquote(tmp_if) + ' type station 2>/dev/null && ip link set dev ' + shellquote(tmp_if) + ' up 2>/dev/null');
+					if (access('/sys/class/net/' + tmp_if)) {
+						push(ifaces, tmp_if);
+					}
+				}
+			}
+
+			for (let dev in ifaces) {
+				let res = ubus_conn.call('iwinfo', 'scan', { device: dev });
+				let cells = res?.results;
+
+				if (res == null) {
+					let cli_out = run_cmd('iwinfo -j ' + shellquote(dev) + ' scan 2>/dev/null');
+					cells = parse_json_safe(cli_out, null);
+					if (!cells || !length(cells)) {
+						let iw_out = run_cmd('iw dev ' + shellquote(dev) + ' scan 2>/dev/null');
+						if (iw_out && length(iw_out) > 50) {
+							cells = parse_iw_scan(iw_out, dev);
+						}
+					}
+				}
+
+				for (let cell in (cells || [])) {
+					if (!cell.ssid || trim(cell.ssid) == '') continue;
+					let key = cell.ssid + '|' + (cell.bssid || '');
+					if (seen[key]) continue;
+					seen[key] = true;
+
+					let enc = cell.encryption || cell.crypto || {};
+					let enc_uci = 'none';
+					let enc_desc = 'Open';
+					if (enc.enabled || (enc.key_mgmt && length(enc.key_mgmt))) {
+						let km = join(' ', enc.key_mgmt || []);
+						let wpa_list = enc.wpa || [];
+						if (match(km, /SAE|WPA3/) || index(wpa_list, 3) >= 0) {
+							enc_uci = 'sae';
+							enc_desc = 'WPA3-SAE';
+						} else if (match(km, /PSK|WPA2/) || index(wpa_list, 2) >= 0) {
+							enc_uci = 'psk2';
+							enc_desc = 'WPA2-PSK';
+						} else {
+							enc_uci = 'psk-mixed';
+							enc_desc = 'WPA/WPA2-Mixed';
+						}
+					}
+
+					let ch = cell.channel || 0;
+					let sig = cell.signal || cell.dbm || -80;
+					let b_name = (ch > 14 || cell.band == '5' || match(String(cell.frequency || ''), /^5/)) ? '5GHz' : '2.4GHz';
+
+					if (req.args?.band && req.args.band != 'auto') {
+						if (req.args.band == '5g' && b_name != '5GHz') continue;
+						if (req.args.band == '2g' && b_name != '2.4GHz') continue;
+					}
+
+					push(results, {
+						ssid: cell.ssid,
+						bssid: cell.bssid || '',
+						channel: ch,
+						band: b_name,
+						device: dev,
+						signal: sig,
+						quality: cell.quality || 0,
+						quality_max: cell.quality_max || 70,
+						encryption_uci: enc_uci,
+						encryption_desc: enc_desc
+					});
+				}
+			}
+
+			for (let dev in ifaces) {
+				if (match(dev, /^glscan_/)) {
+					run_cmd('iw dev ' + shellquote(dev) + ' del 2>/dev/null');
+				}
+			}
+
+			if (!length(results)) {
+				run_bg('wifi reload; wifi up');
+			}
+
+			sort(results, (a, b) => (b.signal - a.signal));
+			return { networks: results };
+		}
+	},
+
+	connect_repeater: {
+		args: {
+			ssid: "",
+			key: "",
+			encryption: "",
+			bssid: "",
+			device: "",
+			lock_bssid: true,
+			remember: true,
+			proto: "",
+			ipaddr: "",
+			netmask: "",
+			gateway: ""
+		},
+		call: function(req) {
+			let a = req.args || {};
+			if (!a.ssid) return { error: 'SSID is required' };
+			let c = cursor();
+
+			let r_dev = a.device || 'radio0';
+			let sta_sec = 'sta_' + r_dev;
+
+			c.set('wireless', sta_sec, 'wifi-iface');
+			c.set('wireless', sta_sec, 'device', r_dev);
+			c.set('wireless', sta_sec, 'mode', 'sta');
+			c.set('wireless', sta_sec, 'network', 'wwan');
+			c.set('wireless', sta_sec, 'ssid', a.ssid);
+			c.set('wireless', sta_sec, 'encryption', a.encryption || 'psk2');
+			if (a.encryption != 'none' && a.key) {
+				c.set('wireless', sta_sec, 'key', a.key);
+			} else {
+				c.delete('wireless', sta_sec, 'key');
+			}
+			if (a.lock_bssid && a.bssid) {
+				c.set('wireless', sta_sec, 'bssid', a.bssid);
+			} else {
+				c.delete('wireless', sta_sec, 'bssid');
+			}
+			c.set('wireless', sta_sec, 'disabled', '0');
+			c.set('wireless', r_dev, 'disabled', '0');
+			c.commit('wireless');
+
+			c.set('network', 'wwan', 'interface');
+			c.set('network', 'wwan', 'proto', a.proto || 'dhcp');
+			c.set('network', 'wwan', 'disabled', '0');
+			c.set('network', 'wwan', 'metric', '20');
+			if (a.proto == 'static') {
+				if (a.ipaddr) c.set('network', 'wwan', 'ipaddr', a.ipaddr);
+				if (a.netmask) c.set('network', 'wwan', 'netmask', a.netmask);
+				if (a.gateway) c.set('network', 'wwan', 'gateway', a.gateway);
+			}
+			c.commit('network');
+
+			c.set('repeater', 'general', 'enabled', '1');
+			c.set('repeater', 'general', 'connected_ssid', a.ssid);
+			c.set('repeater', 'general', 'connected_bssid', a.bssid || '');
+			c.set('repeater', 'general', 'connected_enc', a.encryption || '');
+			c.set('repeater', 'general', 'device', r_dev);
+
+			if (a.remember != false) {
+				let s_id = 'net_' + replace(a.ssid, /[^A-Za-z0-9_]/g, '_');
+				c.set('repeater', s_id, 'sta');
+				c.set('repeater', s_id, 'ssid', a.ssid);
+				c.set('repeater', s_id, 'encryption', a.encryption || 'psk2');
+				c.set('repeater', s_id, 'key', a.key || '');
+				c.set('repeater', s_id, 'device', r_dev);
+				if (a.bssid) c.set('repeater', s_id, 'bssid', a.bssid);
+			}
+			c.commit('repeater');
+
+			run_bg('wifi reload; wifi up; /etc/init.d/network reload; /etc/init.d/gl-repeater restart');
+			return { ok: true };
+		}
+	},
+
+	manage_repeater: {
+		args: {
+			action: "",
+			section: "",
+			auto: true,
+			band: "",
+			scan_interval: 0
+		},
+		call: function(req) {
+			let a = req.args || {};
+			let c = cursor();
+
+			if (a.action == 'disconnect') {
+				c.set('repeater', 'general', 'enabled', '0');
+				c.commit('repeater');
+				c.foreach('wireless', 'wifi-iface', function(s) {
+					if (s.mode == 'sta') {
+						c.set('wireless', s['.name'], 'disabled', '1');
+					}
+				});
+				c.commit('wireless');
+				c.set('network', 'wwan', 'disabled', '1');
+				c.commit('network');
+				run_bg('wifi reload; /etc/init.d/network reload');
+			} else if (a.action == 'delete_saved' && a.section) {
+				c.delete('repeater', a.section);
+				c.commit('repeater');
+			} else if (a.action == 'set_auto') {
+				c.set('repeater', 'general', 'auto', a.auto ? '1' : '0');
+				if (a.scan_interval) c.set('repeater', 'general', 'scan_interval', String(int(a.scan_interval)));
+				c.commit('repeater');
+			}
+
+			return { ok: true };
+		}
+	},
+
+	set_tethering_modem: {
+		args: {
+			tethering_enabled: true,
+			tethering_device: "",
+			usb_power: true,
+			modem_enable: true,
+			apn: "",
+			pincode: "",
+			sim_num: "",
+			modem_device: "",
+			at_cmd: ""
+		},
+		call: function(req) {
+			let a = req.args || {};
+			let c = cursor();
+
+			if (a.tethering_enabled != null) {
+				c.set('network', 'tethering', 'disabled', a.tethering_enabled ? '0' : '1');
+				c.set('network', 'tethering', 'device', a.tethering_device || 'usb0');
+				c.set('network', 'tethering', 'proto', 'dhcp');
+				c.set('network', 'tethering', 'metric', '30');
+			}
+
+			if (a.usb_power != null) {
+				c.set('glconfig', 'general', 'usb_power', a.usb_power ? '1' : '0');
+				writefile('/sys/class/gpio/usb_power/value', a.usb_power ? '1' : '0');
+			}
+
+			if (a.modem_enable != null) {
+				c.set('glmodem', 'general', 'enable', a.modem_enable ? '1' : '0');
+				if (a.apn) c.set('glmodem', 'general', 'apn', a.apn);
+				if (a.pincode != null) c.set('glmodem', 'general', 'pin', a.pincode);
+				c.set('network', 'modem', 'disabled', a.modem_enable ? '0' : '1');
+				c.set('network', 'modem', 'device', a.modem_device || 'wwan0');
+				c.set('network', 'modem', 'proto', 'dhcp');
+				c.set('network', 'modem', 'metric', '40');
+			}
+
+			c.commit('network');
+			c.commit('glconfig');
+			c.commit('glmodem');
+			run_bg('/etc/init.d/network reload');
+			return { ok: true };
+		}
+	},
+
+	set_multiwan_macclone: {
+		args: {
+			mwan_enable: true,
+			mwan_mode: "",
+			mwan_interval: 0,
+			wan_metric: 0,
+			wwan_metric: 0,
+			tethering_metric: 0,
+			modem_metric: 0,
+			track_ip1: "",
+			track_ip2: "",
+			mac_mode: "",
+			mac_addr: ""
+		},
+		call: function(req) {
+			let a = req.args || {};
+			let c = cursor();
+
+			if (a.mwan_enable != null) {
+				c.set('kmwan', 'general', 'enabled', a.mwan_enable ? '1' : '0');
+				if (a.mwan_mode) c.set('kmwan', 'general', 'mode', a.mwan_mode);
+				if (a.mwan_interval) c.set('kmwan', 'general', 'interval', String(int(a.mwan_interval)));
+				if (a.track_ip1) c.set('kmwan', 'general', 'track_ip1', a.track_ip1);
+				if (a.track_ip2) c.set('kmwan', 'general', 'track_ip2', a.track_ip2);
+				c.commit('kmwan');
+			}
+
+			if (a.wan_metric) c.set('network', 'wan', 'metric', String(int(a.wan_metric)));
+			if (a.wwan_metric) c.set('network', 'wwan', 'metric', String(int(a.wwan_metric)));
+			if (a.tethering_metric) c.set('network', 'tethering', 'metric', String(int(a.tethering_metric)));
+			if (a.modem_metric) c.set('network', 'modem', 'metric', String(int(a.modem_metric)));
+
+			if (a.mac_mode != null) {
+				let mode = a.mac_mode;
+				c.set('gl_macclone', 'mac', 'mode', mode);
+				let final_mac = '';
+				if (mode == '0') {
+					final_mac = get_factory_mac();
+				} else if (mode == '2') {
+					let rnd = [];
+					for (let i = 0; i < 6; i++) {
+						let b = int(rand() * 256);
+						if (i == 0) b = (b & 0xfe) | 0x02;
+						push(rnd, sprintf('%02X', b));
+					}
+					final_mac = join(':', rnd);
+				} else if (mode == '3' && a.mac_addr) {
+					final_mac = uc(trim(a.mac_addr));
+				}
+
+				if (final_mac) {
+					c.set('gl_macclone', 'mac', 'mac', final_mac);
+					c.set('network', 'wan', 'macaddr', final_mac);
+					run_bg(`ip link set dev wan address ${final_mac} 2>/dev/null || true`);
+				}
+				c.commit('gl_macclone');
+			}
+
+			c.commit('network');
+			run_bg('/etc/init.d/network reload; /etc/init.d/gl-mwan restart');
+			return { ok: true };
+		}
+	},
+
+	get_wifi_config: {
+		call: function() {
+			let c = cursor();
+			let radios = {};
+			c.foreach('wireless', 'wifi-device', function(s) {
+				let r = s['.name'];
+				radios[r] = {
+					device: r,
+					band: s.band || ((r == 'radio1') ? '5g' : '2g'),
+					channel: s.channel || 'auto',
+					htmode: s.htmode || '',
+					txpower: s.txpower || '',
+					country: s.country || 'US',
+					disabled: (s.disabled == '1')
+				};
+			});
+
+			if (!length(radios)) {
+				radios['radio0'] = { device: 'radio0', band: '2g', channel: 'auto', htmode: 'HT20', txpower: '20', country: 'US', disabled: false };
+				radios['radio1'] = { device: 'radio1', band: '5g', channel: 'auto', htmode: 'VHT80', txpower: '20', country: 'US', disabled: false };
+			}
+
+			let ifaces = {};
+			c.foreach('wireless', 'wifi-iface', function(s) {
+				if (s.mode == 'sta') return;
+				let sec = s['.name'];
+				let dev = s.device || 'radio0';
+				let band = radios[dev]?.band || (dev == 'radio1' ? '5g' : '2g');
+				let is_guest = (s.network == 'guest' || match(sec, /guest/));
+				let slot = (is_guest ? 'guest_' : 'main_') + ((band == '5g') ? '5g' : '2g');
+				ifaces[slot] = {
+					section: sec,
+					device: dev,
+					enabled: (s.disabled != '1'),
+					ssid: s.ssid || (is_guest ? 'GL-A1300-Guest' : 'GL-A1300'),
+					encryption: s.encryption || 'psk2',
+					key: s.key || '',
+					hidden: (s.hidden == '1'),
+					isolate: (s.isolate == '1'),
+					channel: radios[dev]?.channel || 'auto',
+					htmode: radios[dev]?.htmode || '',
+					txpower: radios[dev]?.txpower || ''
+				};
+			});
+
+			return {
+				radios: radios,
+				ifaces: ifaces,
+				guest_ip: c.get('network', 'guest', 'ipaddr') || '192.168.9.1',
+				guest_lan_access: (c.get('gl-black_white_list', 'guest', 'transfer_enable') == '1'),
+				schedule_enable: (c.get('gl_timer', 'wifi', 'enable') == '1'),
+				schedule_off: c.get('gl_timer', 'wifi', 'off_time') || '23:30',
+				schedule_on: c.get('gl_timer', 'wifi', 'on_time') || '06:30'
+			};
+		}
+	},
+
+	set_wifi_config: {
+		args: {
+			ifaces: {},
+			guest_ip: "",
+			guest_lan_access: true,
+			schedule_enable: true,
+			schedule_off: "",
+			schedule_on: ""
+		},
+		call: function(req) {
+			let a = req.args || {};
+			let c = cursor();
+			let ifaces = a.ifaces || {};
+			let any_guest_enabled = false;
+
+			for (let slot in ifaces) {
+				let cfg = ifaces[slot];
+				if (!cfg) continue;
+				let dev = cfg.device || ((match(slot, /5g/)) ? 'radio1' : 'radio0');
+				let sec = cfg.section;
+				let is_guest = match(slot, /^guest_/);
+
+				if (!sec || sec == '' || !c.get('wireless', sec)) {
+					c.foreach('wireless', 'wifi-iface', function(s) {
+						if (s.mode == 'sta') return;
+						let s_guest = (s.network == 'guest' || match(s['.name'], /guest/));
+						if (s.device == dev && s_guest == is_guest) {
+							sec = s['.name'];
+						}
+					});
+					if (!sec || sec == '') {
+						sec = is_guest ? (slot == 'guest_5g' ? 'guest_5g' : 'guest_2g') : ('default_' + dev);
+					}
+				}
+
+				// Remove any duplicate conflicting AP sections for the same radio and guest status
+				c.foreach('wireless', 'wifi-iface', function(s) {
+					if (s.mode == 'sta') return;
+					let s_guest = (s.network == 'guest' || match(s['.name'], /guest/));
+					if (s.device == dev && s_guest == is_guest && s['.name'] != sec) {
+						c.delete('wireless', s['.name']);
+					}
+				});
+
+				c.set('wireless', sec, 'wifi-iface');
+				c.set('wireless', sec, 'device', dev);
+				c.set('wireless', sec, 'mode', 'ap');
+				c.set('wireless', sec, 'network', is_guest ? 'guest' : 'lan');
+				c.set('wireless', sec, 'disabled', cfg.enabled ? '0' : '1');
+				c.set('wireless', sec, 'ssid', cfg.ssid || 'GL-A1300');
+				c.set('wireless', sec, 'encryption', cfg.encryption || 'psk2');
+				if (cfg.encryption != 'none' && cfg.key) {
+					c.set('wireless', sec, 'key', cfg.key);
+				} else if (cfg.encryption == 'none') {
+					c.delete('wireless', sec, 'key');
+				}
+				c.set('wireless', sec, 'hidden', cfg.hidden ? '1' : '0');
+				c.set('wireless', sec, 'isolate', cfg.isolate ? '1' : '0');
+
+				if (!is_guest) {
+					c.set('wireless', dev, 'wifi-device');
+					if (cfg.enabled) {
+						c.set('wireless', dev, 'disabled', '0');
+					}
+					if (cfg.channel && cfg.channel != 'auto') {
+						c.set('wireless', dev, 'channel', cfg.channel);
+					}
+					if (cfg.htmode) c.set('wireless', dev, 'htmode', cfg.htmode);
+					if (cfg.txpower != null && cfg.txpower != '') {
+						c.set('wireless', dev, 'txpower', String(int(cfg.txpower)));
+					}
+				} else if (cfg.enabled) {
+					any_guest_enabled = true;
+				}
+			}
+
+			c.set('network', 'guest', 'disabled', any_guest_enabled ? '0' : '1');
+			if (a.guest_ip) {
+				c.set('network', 'guest', 'ipaddr', a.guest_ip);
+			}
+			if (a.guest_lan_access != null) {
+				c.set('gl-black_white_list', 'guest', 'transfer_enable', a.guest_lan_access ? '1' : '0');
+			}
+			if (a.schedule_enable != null) {
+				c.set('gl_timer', 'wifi', 'enable', a.schedule_enable ? '1' : '0');
+				if (a.schedule_off) c.set('gl_timer', 'wifi', 'off_time', a.schedule_off);
+				if (a.schedule_on) c.set('gl_timer', 'wifi', 'on_time', a.schedule_on);
+			}
+
+			c.commit('wireless');
+			c.commit('network');
+			c.commit('gl-black_white_list');
+			c.commit('gl_timer');
+
+			run_bg('wifi reload; wifi up; /etc/init.d/network reload; /etc/init.d/gl-firewall-addons reload');
+			return { ok: true };
+		}
+	},
+
+	get_vpn_details: {
+		call: function() {
+			let c = cursor();
+			let ubus_conn = connect();
+			let wg_st = get_if_status(ubus_conn, 'wgclient');
+
+			let wg_profiles = [];
+			c.foreach('wireguard', 'peers', function(s) {
+				push(wg_profiles, {
+					id: s['.name'],
+					name: s.name || s['.name'],
+					address: s.address_v4 || '',
+					endpoint: (s.endpoint_host || '') + (s.endpoint_port ? ':' + s.endpoint_port : ''),
+					dns: s.dns || '',
+					public_key: s.public_key || ''
+				});
+			});
+
+			let wg_server_peers = [];
+			c.foreach('wireguard_server', 'peers', function(s) {
+				push(wg_server_peers, {
+					id: s['.name'],
+					name: s.name || s['.name'],
+					client_ip: s.client_ip || '',
+					public_key: s.public_key || '',
+					private_key: s.private_key || ''
+				});
+			});
+
+			let ovpn_profiles = [];
+			c.foreach('ovpnclient', 'clients', function(s) {
+				push(ovpn_profiles, {
+					id: s['.name'],
+					name: s.name || s['.name'],
+					username: s.username || ''
+				});
+			});
+
+			let zt_join = c.get('zerotier', 'gl', 'join') || [];
+			if (type(zt_join) == 'string') zt_join = [ zt_join ];
+
+			return {
+				wg_client: {
+					enabled: (c.get('wireguard', 'global', 'enabled') == '1'),
+					up: wg_st.up,
+					ipaddr: wg_st.ipaddr,
+					active_profile: c.get('wireguard', 'global', 'active_profile') || '',
+					profiles: wg_profiles
+				},
+				wg_server: {
+					enable: (c.get('wireguard_server', 'main_server', 'enable') == '1'),
+					address_v4: c.get('wireguard_server', 'main_server', 'address_v4') || '10.0.0.1/24',
+					port: c.get('wireguard_server', 'main_server', 'port') || '51820',
+					public_key: c.get('wireguard_server', 'main_server', 'public_key') || '',
+					private_key: c.get('wireguard_server', 'main_server', 'private_key') || '',
+					client_to_client: (c.get('wireguard_server', 'main_server', 'client_to_client') != '0'),
+					peers: wg_server_peers
+				},
+				ovpn_client: {
+					enable: (c.get('ovpnclient', 'global', 'enable') == '1'),
+					active_profile: c.get('ovpnclient', 'global', 'active_profile') || '',
+					profiles: ovpn_profiles
+				},
+				ovpn_server: {
+					enable: (c.get('ovpnserver', 'global', 'enable') == '1'),
+					proto: c.get('ovpnserver', 'vpn', 'proto') || 'udp',
+					port: c.get('ovpnserver', 'vpn', 'port') || '1194',
+					subnetv4: c.get('ovpnserver', 'vpn', 'subnetv4') || '10.8.0.0',
+					mask: c.get('ovpnserver', 'vpn', 'mask') || '255.255.255.0'
+				},
+				policy: {
+					kill_switch: (c.get('vpnpolicy', 'global', 'kill_switch') == '1'),
+					wan_access: (c.get('vpnpolicy', 'global', 'wan_access') != '0'),
+					service_policy: (c.get('vpnpolicy', 'global', 'service_policy') != '0'),
+					proxy_mode: c.get('vpnpolicy', 'route_policy', 'proxy_mode') || '0',
+					mode: c.get('vpnpolicy', 'route_policy', 'mode') || 'global',
+					rule_type: c.get('vpnpolicy', 'route_policy', 'rule_type') || 'bypass',
+					mac_list: c.get('vpnpolicy', 'route_policy', 'mac_list') || [],
+					domain_list: c.get('vpnpolicy', 'route_policy', 'domain_list') || [],
+					guest_vpn: (c.get('vpnpolicy', 'vlan', 'guest') != '0')
+				},
+				mesh: {
+					tailscale_enabled: (c.get('tailscale', 'settings', 'enabled') == '1'),
+					tailscale_lan: (c.get('tailscale', 'settings', 'lan_enabled') != '0'),
+					tailscale_wan: (c.get('tailscale', 'settings', 'wan_enabled') == '1'),
+					tailscale_exit_node: c.get('tailscale', 'settings', 'exit_node_ip') || '',
+					tailscale_auth_key: c.get('tailscale', 'settings', 'auth_key') || '',
+					zerotier_enabled: (c.get('zerotier', 'gl', 'enabled') == '1'),
+					zerotier_id: zt_join[0] || '',
+					zerotier_lan: (c.get('zerotier', 'gl', 'lan_enabled') != '0'),
+					zerotier_wan: (c.get('zerotier', 'gl', 'wan_enabled') == '1'),
+					tor_enabled: (c.get('tor', 'global', 'enable') == '1'),
+					tor_countries: c.get('tor', 'global', 'countries') || 'all'
+				}
+			};
+		}
+	},
+
+	save_vpn: {
+		args: {
+			section_type: "",
+			data: {}
+		},
+		call: function(req) {
+			let stype = req.args?.section_type || '';
+			let d = req.args?.data || {};
+			let c = cursor();
+
+			if (stype == 'wg_client') {
+				if (d.action == 'import' && d.name && d.conf_text) {
+					let p = parse_wg_conf(d.conf_text);
+					let pid = 'wg_' + replace(d.name, /[^A-Za-z0-9_]/g, '_');
+					c.set('wireguard', pid, 'peers');
+					c.set('wireguard', pid, 'name', d.name);
+					c.set('wireguard', pid, 'private_key', p.private_key);
+					c.set('wireguard', pid, 'address_v4', p.address);
+					c.set('wireguard', pid, 'dns', p.dns);
+					c.set('wireguard', pid, 'mtu', p.mtu || '1420');
+					c.set('wireguard', pid, 'public_key', p.public_key);
+					c.set('wireguard', pid, 'preshared_key', p.preshared_key);
+					c.set('wireguard', pid, 'endpoint_host', p.endpoint_host);
+					c.set('wireguard', pid, 'endpoint_port', p.endpoint_port || '51820');
+					c.set('wireguard', pid, 'allowed_ips', p.allowed_ips || '0.0.0.0/0');
+					c.set('wireguard', pid, 'persistent_keepalive', p.persistent_keepalive || '25');
+					c.set('wireguard', 'global', 'active_profile', pid);
+					c.commit('wireguard');
+					return { ok: true };
+				}
+
+				if (d.enable != null) {
+					c.set('wireguard', 'global', 'enabled', d.enable ? '1' : '0');
+				}
+				if (d.active_profile) {
+					c.set('wireguard', 'global', 'active_profile', d.active_profile);
+				}
+				c.commit('wireguard');
+
+				let active_pid = c.get('wireguard', 'global', 'active_profile');
+				let is_en = (c.get('wireguard', 'global', 'enabled') == '1');
+
+				if (active_pid && is_en) {
+					let s = c.get_all('wireguard', active_pid);
+					if (s) {
+						c.set('network', 'wgclient', 'interface');
+						c.set('network', 'wgclient', 'proto', 'wireguard');
+						c.set('network', 'wgclient', 'private_key', s.private_key || '');
+						c.set('network', 'wgclient', 'addresses', [ s.address_v4 || '10.2.0.2/32' ]);
+						if (s.dns) c.set('network', 'wgclient', 'dns', split(s.dns, /[\s,]+/));
+						c.set('network', 'wgclient', 'metric', '5');
+						c.set('network', 'wgclient', 'disabled', '0');
+
+						c.set('network', 'wgserver_peer', 'wireguard_wgclient');
+						c.set('network', 'wgserver_peer', 'public_key', s.public_key || '');
+						if (s.preshared_key) c.set('network', 'wgserver_peer', 'preshared_key', s.preshared_key);
+						else c.delete('network', 'wgserver_peer', 'preshared_key');
+						c.set('network', 'wgserver_peer', 'endpoint_host', s.endpoint_host || '');
+						c.set('network', 'wgserver_peer', 'endpoint_port', s.endpoint_port || '51820');
+						c.set('network', 'wgserver_peer', 'allowed_ips', [ s.allowed_ips || '0.0.0.0/0' ]);
+						c.set('network', 'wgserver_peer', 'route_allowed_ips', '1');
+						c.set('network', 'wgserver_peer', 'persistent_keepalive', s.persistent_keepalive || '25');
+						c.set('network', 'wgserver_peer', 'disabled', '0');
+						c.commit('network');
+
+						c.set('firewall', 'vpn_zone', 'zone');
+						c.set('firewall', 'vpn_zone', 'name', 'vpn');
+						c.set('firewall', 'vpn_zone', 'input', 'REJECT');
+						c.set('firewall', 'vpn_zone', 'output', 'ACCEPT');
+						c.set('firewall', 'vpn_zone', 'forward', 'REJECT');
+						c.set('firewall', 'vpn_zone', 'masq', '1');
+						c.set('firewall', 'vpn_zone', 'mtu_fix', '1');
+						c.set('firewall', 'vpn_zone', 'network', [ 'wgclient', 'ovpnclient', 'wg0', 'wireguard' ]);
+
+						c.set('firewall', 'lan_vpn', 'forwarding');
+						c.set('firewall', 'lan_vpn', 'src', 'lan');
+						c.set('firewall', 'lan_vpn', 'dest', 'vpn');
+						c.commit('firewall');
+					}
+				} else {
+					c.set('network', 'wgclient', 'disabled', '1');
+					c.commit('network');
+				}
+				run_bg('/etc/init.d/network reload; /etc/init.d/gl-vpnpolicy reload');
+			} else if (stype == 'wg_server') {
+				if (d.action == 'add_peer' && d.name) {
+					let pid = 'peer_' + replace(d.name, /[^A-Za-z0-9_]/g, '_');
+					let priv = run_cmd('wg genkey');
+					let pub = priv ? run_cmd(`echo ${priv} | wg pubkey`) : '';
+					c.set('wireguard_server', pid, 'peers');
+					c.set('wireguard_server', pid, 'name', d.name);
+					c.set('wireguard_server', pid, 'client_ip', d.client_ip || '10.0.0.2/32');
+					c.set('wireguard_server', pid, 'private_key', priv);
+					c.set('wireguard_server', pid, 'public_key', pub);
+					c.commit('wireguard_server');
+					return { ok: true };
+				} else if (d.action == 'del_peer' && d.peer_id) {
+					c.delete('wireguard_server', d.peer_id);
+					c.commit('wireguard_server');
+					return { ok: true };
+				}
+
+				c.set('wireguard_server', 'main_server', 'enable', d.enable ? '1' : '0');
+				if (d.address_v4) c.set('wireguard_server', 'main_server', 'address_v4', d.address_v4);
+				if (d.port) c.set('wireguard_server', 'main_server', 'port', String(int(d.port)));
+				c.commit('wireguard_server');
+
+				c.set('network', 'wgserver', 'interface');
+				c.set('network', 'wgserver', 'proto', 'wireguard');
+				c.set('network', 'wgserver', 'private_key', c.get('wireguard_server', 'main_server', 'private_key') || '');
+				c.set('network', 'wgserver', 'listen_port', c.get('wireguard_server', 'main_server', 'port') || '51820');
+				c.set('network', 'wgserver', 'addresses', [ c.get('wireguard_server', 'main_server', 'address_v4') || '10.0.0.1/24' ]);
+				c.set('network', 'wgserver', 'disabled', d.enable ? '0' : '1');
+				c.commit('network');
+				run_bg('/etc/init.d/network reload');
+			} else if (stype == 'openvpn') {
+				if (d.ovpn_text && d.profile_name) {
+					mkdir('/etc/openvpn', 0755);
+					let pid = 'ovpn_' + replace(d.profile_name, /[^A-Za-z0-9_]/g, '_');
+					let path = `/etc/openvpn/${pid}.ovpn`;
+					writefile(path, d.ovpn_text);
+					c.set('ovpnclient', pid, 'clients');
+					c.set('ovpnclient', pid, 'name', d.profile_name);
+					c.set('ovpnclient', pid, 'config', path);
+					if (d.username) c.set('ovpnclient', pid, 'username', d.username);
+					c.set('ovpnclient', 'global', 'active_profile', pid);
+				}
+				if (d.client_enable != null) {
+					c.set('ovpnclient', 'global', 'enable', d.client_enable ? '1' : '0');
+				}
+				if (d.server_enable != null) {
+					c.set('ovpnserver', 'global', 'enable', d.server_enable ? '1' : '0');
+					if (d.server_port) c.set('ovpnserver', 'vpn', 'port', String(int(d.server_port)));
+					if (d.server_proto) c.set('ovpnserver', 'vpn', 'proto', d.server_proto);
+					if (d.server_subnet) c.set('ovpnserver', 'vpn', 'subnetv4', d.server_subnet);
+				}
+				c.commit('ovpnclient');
+				c.commit('ovpnserver');
+				run_bg('[ -x /etc/init.d/openvpn ] && /etc/init.d/openvpn restart; /etc/init.d/gl-vpnpolicy reload');
+			} else if (stype == 'policy') {
+				c.set('vpnpolicy', 'global', 'kill_switch', d.kill_switch ? '1' : '0');
+				c.set('vpnpolicy', 'global', 'wan_access', d.wan_access ? '1' : '0');
+				c.set('vpnpolicy', 'global', 'service_policy', d.service_policy ? '1' : '0');
+				c.set('vpnpolicy', 'route_policy', 'proxy_mode', d.proxy_mode || '0');
+				c.set('vpnpolicy', 'route_policy', 'mode', d.mode || 'global');
+				c.set('vpnpolicy', 'route_policy', 'rule_type', d.rule_type || 'bypass');
+				if (d.mac_list != null) {
+					let ml = split(trim(String(d.mac_list)), /[\s,]+/);
+					c.set('vpnpolicy', 'route_policy', 'mac_list', filter(ml, x => length(x) > 0));
+				}
+				if (d.domain_list != null) {
+					let dl = split(trim(String(d.domain_list)), /[\s,]+/);
+					c.set('vpnpolicy', 'route_policy', 'domain_list', filter(dl, x => length(x) > 0));
+				}
+				if (d.guest_vpn != null) {
+					c.set('vpnpolicy', 'vlan', 'guest', d.guest_vpn ? '1' : '0');
+				}
+				c.commit('vpnpolicy');
+				run_bg('/etc/init.d/gl-vpnpolicy reload');
+			} else if (stype == 'mesh') {
+				if (d.tailscale_enabled != null) {
+					c.set('tailscale', 'settings', 'enabled', d.tailscale_enabled ? '1' : '0');
+					c.set('tailscale', 'settings', 'lan_enabled', d.tailscale_lan ? '1' : '0');
+					c.set('tailscale', 'settings', 'wan_enabled', d.tailscale_wan ? '1' : '0');
+					c.set('tailscale', 'settings', 'exit_node_ip', d.tailscale_exit_node || '');
+					c.set('tailscale', 'settings', 'auth_key', d.tailscale_auth_key || '');
+					c.commit('tailscale');
+					run_bg('[ -x /etc/init.d/tailscale ] && /etc/init.d/tailscale restart');
+				}
+				if (d.zerotier_enabled != null) {
+					c.set('zerotier', 'gl', 'enabled', d.zerotier_enabled ? '1' : '0');
+					c.set('zerotier', 'gl', 'lan_enabled', d.zerotier_lan ? '1' : '0');
+					c.set('zerotier', 'gl', 'wan_enabled', d.zerotier_wan ? '1' : '0');
+					if (d.zerotier_id != null) {
+						c.set('zerotier', 'gl', 'join', d.zerotier_id ? [ d.zerotier_id ] : []);
+					}
+					c.commit('zerotier');
+					run_bg('[ -x /etc/init.d/zerotier ] && /etc/init.d/zerotier restart');
+				}
+				if (d.tor_enabled != null) {
+					c.set('tor', 'global', 'enable', d.tor_enabled ? '1' : '0');
+					if (d.tor_countries) c.set('tor', 'global', 'countries', d.tor_countries);
+					c.commit('tor');
+					run_bg('[ -x /etc/init.d/tor ] && /etc/init.d/tor restart');
+				}
+			}
+
+			return { ok: true };
+		}
+	},
+
+	get_clients_qos: {
+		call: function() {
+			let c = cursor();
+			let ubus_conn = connect();
+			let clients = collect_clients(c, ubus_conn);
+
+			let black_macs = c.get('gl-black_white_list', 'black', 'mac') || [];
+			if (type(black_macs) == 'string') black_macs = [ black_macs ];
+			let white_macs = c.get('gl-black_white_list', 'white', 'mac') || [];
+			if (type(white_macs) == 'string') white_macs = [ white_macs ];
+
+			let pc_macs = c.get('parental_control', 'global', 'blocked_macs') || [];
+			if (type(pc_macs) == 'string') pc_macs = [ pc_macs ];
+			let pc_domains = c.get('parental_control', 'global', 'blocked_domains') || [];
+			if (type(pc_domains) == 'string') pc_domains = [ pc_domains ];
+
+			return {
+				clients: clients,
+				blocklist: {
+					enable: (c.get('gl-black_white_list', 'global', 'enable') != '0'),
+					mode: c.get('gl-black_white_list', 'global', 'mode') || 'black',
+					black_macs: black_macs,
+					white_macs: white_macs,
+					lan_isolate: (c.get('gl-black_white_list', 'lan', 'ap_isolate') == '1'),
+					guest_isolate: (c.get('gl-black_white_list', 'guest', 'ap_isolate') != '0')
+				},
+				qos: {
+					enable: (c.get('qos', 'general', 'enable') == '1'),
+					model: c.get('qos', 'general', 'model') || 'cake',
+					upload: int(c.get('qos', 'general', 'upload') || 100),
+					download: int(c.get('qos', 'general', 'download') || 100)
+				},
+				parental: {
+					enable: (c.get('parental_control', 'global', 'enable') == '1'),
+					blocked_macs: pc_macs,
+					blocked_domains: pc_domains
+				}
+			};
+		}
+	},
+
+	save_clients_qos: {
+		args: {
+			action: "",
+			mac: "",
+			blocked: true,
+			upload_limit: 0,
+			download_limit: 0,
+			hostname: "",
+			data: {}
+		},
+		call: function(req) {
+			let a = req.args || {};
+			let c = cursor();
+
+			if (a.action == 'client_rule' && a.mac) {
+				let umac = uc(trim(a.mac));
+				let bmacs = c.get('gl-black_white_list', 'black', 'mac') || [];
+				if (type(bmacs) == 'string') bmacs = [ bmacs ];
+				let next_bmacs = filter(bmacs, m => uc(trim(m)) != umac);
+				if (a.blocked) push(next_bmacs, umac);
+				c.set('gl-black_white_list', 'black', 'mac', next_bmacs);
+				c.commit('gl-black_white_list');
+
+				let qid = 'q_' + replace(umac, /:/g, '');
+				if ((a.upload_limit && a.upload_limit > 0) || (a.download_limit && a.download_limit > 0)) {
+					c.set('qos', qid, 'queue');
+					c.set('qos', qid, 'mac', umac);
+					c.set('qos', qid, 'name', a.hostname || umac);
+					c.set('qos', qid, 'upload', String(int(a.upload_limit || 0)));
+					c.set('qos', qid, 'download', String(int(a.download_limit || 0)));
+				} else {
+					c.delete('qos', qid);
+				}
+				c.commit('qos');
+				run_bg('/etc/init.d/gl-firewall-addons reload');
+				return { ok: true };
+			}
+
+			let d = a.data || {};
+			if (d.bw_enable != null) {
+				c.set('gl-black_white_list', 'global', 'enable', d.bw_enable ? '1' : '0');
+				c.set('gl-black_white_list', 'global', 'mode', d.bw_mode || 'black');
+				if (d.black_macs != null) {
+					let bm = filter(split(uc(trim(String(d.black_macs))), /[\s,]+/), x => length(x) > 0);
+					c.set('gl-black_white_list', 'black', 'mac', bm);
+				}
+				if (d.white_macs != null) {
+					let wm = filter(split(uc(trim(String(d.white_macs))), /[\s,]+/), x => length(x) > 0);
+					c.set('gl-black_white_list', 'white', 'mac', wm);
+				}
+				c.commit('gl-black_white_list');
+			}
+			if (d.qos_enable != null) {
+				c.set('qos', 'general', 'enable', d.qos_enable ? '1' : '0');
+				if (d.qos_upload != null) c.set('qos', 'general', 'upload', String(int(d.qos_upload)));
+				if (d.qos_download != null) c.set('qos', 'general', 'download', String(int(d.qos_download)));
+				c.commit('qos');
+			}
+			if (d.pc_enable != null) {
+				c.set('parental_control', 'global', 'enable', d.pc_enable ? '1' : '0');
+				if (d.pc_macs != null) {
+					let pm = filter(split(uc(trim(String(d.pc_macs))), /[\s,]+/), x => length(x) > 0);
+					c.set('parental_control', 'global', 'blocked_macs', pm);
+				}
+				if (d.pc_domains != null) {
+					let pd = filter(split(trim(String(d.pc_domains)), /[\s,]+/), x => length(x) > 0);
+					c.set('parental_control', 'global', 'blocked_domains', pd);
+				}
+				c.commit('parental_control');
+			}
+
+			run_bg('/etc/init.d/gl-firewall-addons reload');
+			return { ok: true };
+		}
+	},
+
+	get_network_dns: {
+		call: function() {
+			let c = cursor();
+			let static_leases = [];
+			c.foreach('dhcp', 'host', function(s) {
+				push(static_leases, {
+					id: s['.name'],
+					name: s.name || '',
+					mac: (type(s.mac) == 'array') ? s.mac[0] : (s.mac || ''),
+					ip: s.ip || ''
+				});
+			});
+
+			return {
+				lan: {
+					ipaddr: c.get('network', 'lan', 'ipaddr') || '192.168.8.1',
+					netmask: c.get('network', 'lan', 'netmask') || '255.255.255.0',
+					dhcp_start: int(c.get('dhcp', 'lan', 'start') || 100),
+					dhcp_limit: int(c.get('dhcp', 'lan', 'limit') || 150),
+					dhcp_leasetime: c.get('dhcp', 'lan', 'leasetime') || '12h',
+					dhcp_ignore: (c.get('dhcp', 'lan', 'ignore') == '1'),
+					static_leases: static_leases
+				},
+				dns: {
+					mode: c.get('gl-dns', 'dns', 'mode') || 'auto',
+					manual_dns1: c.get('gl-dns', 'dns', 'manual_dns1') || '1.1.1.1',
+					manual_dns2: c.get('gl-dns', 'dns', 'manual_dns2') || '8.8.8.8',
+					dot_provider: c.get('gl-dns', 'dns', 'dot_provider') || 'cloudflare',
+					doh_provider: c.get('gl-dns', 'dns', 'doh_provider') || 'cloudflare',
+					override_vpn: (c.get('gl-dns', 'dns', 'override_vpn') == '1'),
+					force_dns: (c.get('gl-dns', 'dns', 'force_dns') == '1'),
+					rebind_protection: (c.get('dhcp', '@dnsmasq[0]', 'rebind_protection') != '0')
+				},
+				adguardhome: {
+					enabled: (c.get('adguardhome', 'config', 'enabled') == '1'),
+					port: c.get('adguardhome', 'config', 'port') || '3000',
+					dns_port: c.get('adguardhome', 'config', 'dns_port') || '3053',
+					handle_client_requests: (c.get('adguardhome', 'config', 'handle_client_requests') == '1'),
+					installed: !!access('/usr/bin/AdGuardHome')
+				},
+				ipv6: {
+					enabled: (c.get('glipv6', 'globals', 'enabled') == '1'),
+					wan_addrmode: c.get('glipv6', 'wan', 'addrmode') || 'auto',
+					lan_mode: c.get('glipv6', 'lan', 'mode') || 'nat6'
+				},
+				edgerouter: {
+					enabled: (c.get('edgerouter', 'global', 'enabled') == '1'),
+					force_dns: (c.get('edgerouter', 'global', 'force_dns') != '0'),
+					main_router_ip: c.get('edgerouter', 'global', 'main_router_ip') || ''
+				}
+			};
+		}
+	},
+
+	save_network_dns: {
+		args: {
+			section_type: "",
+			data: {}
+		},
+		call: function(req) {
+			let stype = req.args?.section_type || '';
+			let d = req.args?.data || {};
+			let c = cursor();
+
+			if (stype == 'lan') {
+				if (d.ipaddr) c.set('network', 'lan', 'ipaddr', d.ipaddr);
+				if (d.netmask) c.set('network', 'lan', 'netmask', d.netmask);
+				if (d.dhcp_start != null) c.set('dhcp', 'lan', 'start', String(int(d.dhcp_start)));
+				if (d.dhcp_limit != null) c.set('dhcp', 'lan', 'limit', String(int(d.dhcp_limit)));
+				if (d.dhcp_leasetime) c.set('dhcp', 'lan', 'leasetime', d.dhcp_leasetime);
+				if (d.dhcp_ignore != null) c.set('dhcp', 'lan', 'ignore', d.dhcp_ignore ? '1' : '0');
+				c.commit('network');
+				c.commit('dhcp');
+				run_bg('/etc/init.d/dnsmasq reload; /etc/init.d/network reload');
+			} else if (stype == 'dns') {
+				let mode = d.mode || 'auto';
+				c.set('gl-dns', 'dns', 'mode', mode);
+				if (d.manual_dns1 != null) c.set('gl-dns', 'dns', 'manual_dns1', d.manual_dns1);
+				if (d.manual_dns2 != null) c.set('gl-dns', 'dns', 'manual_dns2', d.manual_dns2);
+				if (d.dot_provider) c.set('gl-dns', 'dns', 'dot_provider', d.dot_provider);
+				if (d.doh_provider) c.set('gl-dns', 'dns', 'doh_provider', d.doh_provider);
+				c.set('gl-dns', 'dns', 'override_vpn', d.override_vpn ? '1' : '0');
+				c.set('gl-dns', 'dns', 'force_dns', d.force_dns ? '1' : '0');
+				c.set('gl-dns', 'dns', 'rebind_protection', d.rebind_protection ? '1' : '0');
+				c.set('dhcp', '@dnsmasq[0]', 'rebind_protection', d.rebind_protection ? '1' : '0');
+
+				if (mode == 'manual') {
+					let servers = [];
+					if (d.manual_dns1) push(servers, d.manual_dns1);
+					if (d.manual_dns2) push(servers, d.manual_dns2);
+					c.set('dhcp', '@dnsmasq[0]', 'noresolv', '1');
+					c.set('dhcp', '@dnsmasq[0]', 'server', servers);
+				} else {
+					c.delete('dhcp', '@dnsmasq[0]', 'noresolv');
+					c.delete('dhcp', '@dnsmasq[0]', 'server');
+				}
+
+				if (d.agh_enabled != null) {
+					c.set('adguardhome', 'config', 'enabled', d.agh_enabled ? '1' : '0');
+					c.set('adguardhome', 'config', 'handle_client_requests', d.agh_handle_clients ? '1' : '0');
+					c.commit('adguardhome');
+				}
+
+				c.commit('gl-dns');
+				c.commit('dhcp');
+				run_bg('/etc/init.d/dnsmasq reload; /etc/init.d/gl-firewall-addons reload');
+			} else if (stype == 'ipv6') {
+				let en = !!d.enabled;
+				c.set('glipv6', 'globals', 'enabled', en ? '1' : '0');
+				if (d.wan_addrmode) c.set('glipv6', 'wan', 'addrmode', d.wan_addrmode);
+				if (d.lan_mode) c.set('glipv6', 'lan', 'mode', d.lan_mode);
+				c.set('network', 'wan6', 'disabled', en ? '0' : '1');
+				c.commit('glipv6');
+				c.commit('network');
+				run_bg('/etc/init.d/network reload');
+			} else if (stype == 'edgerouter') {
+				c.set('edgerouter', 'global', 'enabled', d.enabled ? '1' : '0');
+				c.set('edgerouter', 'global', 'force_dns', d.force_dns ? '1' : '0');
+				if (d.main_router_ip != null) c.set('edgerouter', 'global', 'main_router_ip', d.main_router_ip);
+				c.commit('edgerouter');
+				run_bg('/etc/init.d/gl-firewall-addons reload');
+			}
+
+			return { ok: true };
+		}
+	},
+
+	get_system_hardware: {
+		call: function() {
+			let c = cursor();
+			let mounts = run_cmd("df -h | grep -E '^/dev/sd|^/dev/mmcblk'");
+
+			return {
+				switch_func: c.get('switch-button', 'main', 'func') || 'wifi',
+				switch_state: trim(readfile('/var/run/gl_switch_state') || 'on'),
+				led_enable: (c.get('gl_led', 'global', 'led_enable') != '0'),
+				led_mode: c.get('gl_led', 'global', 'led_mode') || 'white',
+				led_schedule: (c.get('gl_led', 'global', 'schedule_enable') == '1'),
+				led_start: c.get('gl_led', 'global', 'schedule_start') || '22:00',
+				led_end: c.get('gl_led', 'global', 'schedule_end') || '07:00',
+				netmode: c.get('glconfig', 'general', 'mode') || 'router',
+				usb_power: (c.get('glconfig', 'general', 'usb_power') != '0'),
+				lan2wan: (c.get('glconfig', 'general', 'lan2wan') == '1'),
+				nas: {
+					mounts: mounts,
+					samba_workgroup: c.get('samba4', '@samba[0]', 'workgroup') || 'WORKGROUP',
+					dlna_enabled: (c.get('minidlna', 'config', 'enabled') == '1'),
+					dlna_name: c.get('minidlna', 'config', 'friendly_name') || 'GL-A1300 DLNA'
+				},
+				cloud: {
+					goodcloud_enable: (c.get('gl-cloud', 'cloud', 'enable') == '1'),
+					rtty_enable: (c.get('gl-cloud', 'cloud', 'rtty_enable') == '1'),
+					rtty_host: c.get('gl-cloud', 'cloud', 'rtty_host') || '',
+					rtty_port: c.get('gl-cloud', 'cloud', 'rtty_port') || '5912',
+					rtty_token: c.get('gl-cloud', 'cloud', 'rtty_token') || '',
+					rtty_id: c.get('gl-cloud', 'cloud', 'rtty_id') || '',
+					ddns_enabled: (c.get('gl_ddns', 'glddns', 'enabled') == '1'),
+					ddns_domain: c.get('gl_ddns', 'glddns', 'domain') || ''
+				},
+				reboot_timer: {
+					enable: (c.get('gl_timer', 'reboot', 'enable') == '1'),
+					time: c.get('gl_timer', 'reboot', 'time') || '04:00'
+				}
+			};
+		}
+	},
+
+	save_system_hardware: {
+		args: {
+			section_type: "",
+			data: {}
+		},
+		call: function(req) {
+			let stype = req.args?.section_type || '';
+			let d = req.args?.data || {};
+			let c = cursor();
+
+			if (stype == 'hardware') {
+				if (d.switch_func) {
+					c.set('switch-button', 'main', 'func', d.switch_func);
+					c.commit('switch-button');
+				}
+				if (d.led_enable != null) {
+					c.set('gl_led', 'global', 'led_enable', d.led_enable ? '1' : '0');
+					if (d.led_mode) c.set('gl_led', 'global', 'led_mode', d.led_mode);
+					if (d.led_schedule != null) c.set('gl_led', 'global', 'schedule_enable', d.led_schedule ? '1' : '0');
+					if (d.led_start) c.set('gl_led', 'global', 'schedule_start', d.led_start);
+					if (d.led_end) c.set('gl_led', 'global', 'schedule_end', d.led_end);
+					c.commit('gl_led');
+					run_bg('/usr/sbin/gl-led-ctl');
+				}
+				if (d.usb_power != null) {
+					let val = d.usb_power ? '1' : '0';
+					c.set('glconfig', 'general', 'usb_power', val);
+					writefile('/sys/class/gpio/usb_power/value', val);
+				}
+				if (d.netmode) {
+					c.set('glconfig', 'general', 'mode', d.netmode);
+					if (d.netmode == 'ap') {
+						c.set('dhcp', 'lan', 'ignore', '1');
+					} else if (d.netmode == 'router') {
+						c.set('dhcp', 'lan', 'ignore', '0');
+					}
+					c.commit('dhcp');
+				}
+				c.commit('glconfig');
+			} else if (stype == 'nas_cloud') {
+				if (d.dlna_enabled != null) {
+					c.set('minidlna', 'config', 'enabled', d.dlna_enabled ? '1' : '0');
+					if (d.dlna_name) c.set('minidlna', 'config', 'friendly_name', d.dlna_name);
+					c.commit('minidlna');
+				}
+				if (d.rtty_enable != null) {
+					c.set('gl-cloud', 'cloud', 'rtty_enable', d.rtty_enable ? '1' : '0');
+					if (d.rtty_host != null) c.set('gl-cloud', 'cloud', 'rtty_host', d.rtty_host);
+					if (d.rtty_port != null) c.set('gl-cloud', 'cloud', 'rtty_port', d.rtty_port);
+					if (d.rtty_token != null) c.set('gl-cloud', 'cloud', 'rtty_token', d.rtty_token);
+					if (d.rtty_id != null) c.set('gl-cloud', 'cloud', 'rtty_id', d.rtty_id);
+					c.commit('gl-cloud');
+				}
+				if (d.ddns_enabled != null) {
+					c.set('gl_ddns', 'glddns', 'enabled', d.ddns_enabled ? '1' : '0');
+					if (d.ddns_domain != null) c.set('gl_ddns', 'glddns', 'domain', d.ddns_domain);
+					c.commit('gl_ddns');
+				}
+				if (d.reboot_enable != null) {
+					c.set('gl_timer', 'reboot', 'enable', d.reboot_enable ? '1' : '0');
+					if (d.reboot_time) c.set('gl_timer', 'reboot', 'time', d.reboot_time);
+					c.commit('gl_timer');
+				}
+			}
+
+			return { ok: true };
+		}
+	}
+};
+
+return { glinet: methods };

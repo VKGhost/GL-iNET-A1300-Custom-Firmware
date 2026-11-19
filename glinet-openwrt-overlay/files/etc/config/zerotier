@@ -1,0 +1,6 @@
+config zerotier 'gl'
+	option enabled '0'
+	option lan_enabled '1'
+	option wan_enabled '0'
+	option secret ''
+	list join ''

@@ -1,0 +1,192 @@
+#!/bin/sh
+# GL.iNet GL-A1300 OpenWrt 25.12 Setup & Compatibility Defaults
+
+. /lib/functions.sh
+
+# 1. Ensure system compat_version is 1.1 (DSA) and hostname is GL-A1300
+uci -q batch <<'EOF'
+set system.@system[0].hostname='GL-A1300'
+set system.@system[0].compat_version='1.1'
+commit system
+EOF
+
+# 2. Configure LAN (192.168.8.1 like stock GL.iNet + 192.168.1.1 alias for vanilla convenience)
+# Also pre-create guest, wwan (repeater), tethering, and modem network interfaces
+if ! uci -q get network.guest >/dev/null; then
+	uci -q batch <<'EOF'
+set network.lan.ipaddr='192.168.8.1'
+set network.lan.netmask='255.255.255.0'
+
+set network.lan_compat='interface'
+set network.lan_compat.proto='static'
+set network.lan_compat.device='br-lan'
+set network.lan_compat.ipaddr='192.168.1.1'
+set network.lan_compat.netmask='255.255.255.0'
+
+set network.guest_dev='device'
+set network.guest_dev.type='bridge'
+set network.guest_dev.name='br-guest'
+set network.guest_dev.bridge_empty='1'
+
+set network.guest='interface'
+set network.guest.proto='static'
+set network.guest.device='br-guest'
+set network.guest.ipaddr='192.168.9.1'
+set network.guest.netmask='255.255.255.0'
+set network.guest.disabled='1'
+
+set network.wwan='interface'
+set network.wwan.proto='dhcp'
+set network.wwan.metric='20'
+set network.wwan.peerdns='1'
+set network.wwan.disabled='1'
+
+set network.tethering='interface'
+set network.tethering.proto='dhcp'
+set network.tethering.device='usb0'
+set network.tethering.metric='30'
+set network.tethering.disabled='0'
+
+set network.modem='interface'
+set network.modem.proto='dhcp'
+set network.modem.device='wwan0'
+set network.modem.metric='40'
+set network.modem.disabled='1'
+
+set network.wan.metric='10'
+commit network
+EOF
+fi
+
+# 3. Configure DHCP for guest network
+if ! uci -q get dhcp.guest >/dev/null; then
+	uci -q batch <<'EOF'
+set dhcp.guest='dhcp'
+set dhcp.guest.interface='guest'
+set dhcp.guest.start='100'
+set dhcp.guest.limit='150'
+set dhcp.guest.leasetime='12h'
+commit dhcp
+EOF
+fi
+
+# 4. Configure Firewall zones for wwan, tethering, modem, guest, and vpn
+if ! uci -q get firewall.guest_zone >/dev/null; then
+	# Add wwan, tethering, modem to wan zone
+	wan_zone=$(uci show firewall | grep -E "firewall\.@zone\[[0-9]+\]\.name='wan'" | cut -d. -f1-2 | head -n1)
+	if [ -n "$wan_zone" ]; then
+		uci -q del_list ${wan_zone}.network='wwan'
+		uci -q add_list ${wan_zone}.network='wwan'
+		uci -q del_list ${wan_zone}.network='tethering'
+		uci -q add_list ${wan_zone}.network='tethering'
+		uci -q del_list ${wan_zone}.network='modem'
+		uci -q add_list ${wan_zone}.network='modem'
+	fi
+
+	uci -q batch <<'EOF'
+set firewall.guest_zone='zone'
+set firewall.guest_zone.name='guest'
+set firewall.guest_zone.input='REJECT'
+set firewall.guest_zone.output='ACCEPT'
+set firewall.guest_zone.forward='REJECT'
+add_list firewall.guest_zone.network='guest'
+
+set firewall.guest_wan='forwarding'
+set firewall.guest_wan.src='guest'
+set firewall.guest_wan.dest='wan'
+
+set firewall.guest_dns='rule'
+set firewall.guest_dns.name='Allow-Guest-DNS'
+set firewall.guest_dns.src='guest'
+set firewall.guest_dns.dest_port='53'
+add_list firewall.guest_dns.proto='tcp'
+add_list firewall.guest_dns.proto='udp'
+set firewall.guest_dns.target='ACCEPT'
+
+set firewall.guest_dhcp='rule'
+set firewall.guest_dhcp.name='Allow-Guest-DHCP'
+set firewall.guest_dhcp.src='guest'
+set firewall.guest_dhcp.dest_port='67-68'
+set firewall.guest_dhcp.proto='udp'
+set firewall.guest_dhcp.target='ACCEPT'
+
+set firewall.vpn_zone='zone'
+set firewall.vpn_zone.name='vpn'
+set firewall.vpn_zone.input='REJECT'
+set firewall.vpn_zone.output='ACCEPT'
+set firewall.vpn_zone.forward='REJECT'
+set firewall.vpn_zone.masq='1'
+set firewall.vpn_zone.mtu_fix='1'
+add_list firewall.vpn_zone.network='wgclient'
+add_list firewall.vpn_zone.network='ovpnclient'
+add_list firewall.vpn_zone.network='wg0'
+add_list firewall.vpn_zone.network='wireguard'
+
+set firewall.lan_vpn='forwarding'
+set firewall.lan_vpn.src='lan'
+set firewall.lan_vpn.dest='vpn'
+
+set firewall.guest_vpn='forwarding'
+set firewall.guest_vpn.src='guest'
+set firewall.guest_vpn.dest='vpn'
+commit firewall
+EOF
+fi
+
+# 5. Setup default GL-A1300 Wireless naming & Guest AP interfaces if radios exist
+if [ ! -f /etc/config/wireless ] || ! uci -q get wireless.radio0 >/dev/null; then
+	wifi config 2>/dev/null || true
+fi
+
+MAC_SUFFIX=$(cat /sys/class/net/br-lan/address 2>/dev/null | awk -F: '{print toupper($5$6)}')
+[ -z "$MAC_SUFFIX" ] && MAC_SUFFIX="A130"
+
+for r in radio0 radio1; do
+	uci -q get wireless.$r >/dev/null || continue
+	band=$(uci -q get wireless.$r.band)
+	uci -q set wireless.$r.disabled='0'
+	cur_ssid=$(uci -q get wireless.default_$r.ssid)
+	if [ "$band" = "5g" ] || [ "$r" = "radio1" ]; then
+		if [ -z "$cur_ssid" ] || [ "$cur_ssid" = "OpenWrt" ]; then
+			uci -q set wireless.default_$r.ssid="GL-A1300-${MAC_SUFFIX}-5G"
+		fi
+		if ! uci -q get wireless.guest_5g >/dev/null; then
+			uci -q batch <<EOF
+set wireless.guest_5g='wifi-iface'
+set wireless.guest_5g.device='$r'
+set wireless.guest_5g.network='guest'
+set wireless.guest_5g.mode='ap'
+set wireless.guest_5g.ssid='GL-A1300-${MAC_SUFFIX}-Guest-5G'
+set wireless.guest_5g.encryption='psk2'
+set wireless.guest_5g.key='goodlife'
+set wireless.guest_5g.isolate='1'
+set wireless.guest_5g.disabled='1'
+EOF
+		fi
+	else
+		if [ -z "$cur_ssid" ] || [ "$cur_ssid" = "OpenWrt" ]; then
+			uci -q set wireless.default_$r.ssid="GL-A1300-${MAC_SUFFIX}"
+		fi
+		if ! uci -q get wireless.guest_2g >/dev/null; then
+			uci -q batch <<EOF
+set wireless.guest_2g='wifi-iface'
+set wireless.guest_2g.device='$r'
+set wireless.guest_2g.network='guest'
+set wireless.guest_2g.mode='ap'
+set wireless.guest_2g.ssid='GL-A1300-${MAC_SUFFIX}-Guest'
+set wireless.guest_2g.encryption='psk2'
+set wireless.guest_2g.key='goodlife'
+set wireless.guest_2g.isolate='1'
+set wireless.guest_2g.disabled='1'
+EOF
+		fi
+	fi
+done
+uci -q commit wireless
+
+# 6. Enable GL.iNet helper services
+for svc in gl-led gl-mwan gl-repeater gl-vpnpolicy gl-firewall-addons; do
+	[ -x "/etc/init.d/$svc" ] && /etc/init.d/$svc enable 2>/dev/null || true
+done
+
+exit 0

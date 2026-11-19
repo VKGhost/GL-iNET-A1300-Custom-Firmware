@@ -1,0 +1,8 @@
+config settings 'settings'
+	option enabled '0'
+	option lan_enabled '1'
+	option wan_enabled '0'
+	option exit_node_ip ''
+	option auth_key ''
+	option port '41641'
+	option state_file '/etc/tailscale/tailscaled.state'
